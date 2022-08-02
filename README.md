@@ -3,7 +3,7 @@
 This repository serves as the code and CloudFormation template storage for two blog posts:
 
 * [Securely scale multi-account architecture with AWS Network Firewall and AWS Control Tower](https://aws.amazon.com/blogs/mt/scale-multi-account-architecture-aws-network-firewall-and-aws-control-tower/)
-* [https://aws.amazon.com/blogs/mt/extending-your-control-tower-network-security-with-aws-route-53-dns-firewall/](https://aws.amazon.com/blogs/mt/extending-your-control-tower-network-security-with-aws-route-53-dns-firewall/)
+* [Extending your Control Tower Network security with Amazon Route 53 DNS Firewall](https://aws.amazon.com/blogs/mt/extending-your-control-tower-network-security-with-aws-route-53-dns-firewall/)
 
 If you plan to deploy the code in this repo, plase follow along with the blog posts for step-by-step instructions and architecture diagrams.
 
