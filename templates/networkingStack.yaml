@@ -1,0 +1,531 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Network Firewall, Route 53 Resolver & ControlTower Integration - Deploys resources for Networking integration with TGW.
+Parameters:
+  LambdaBucket:
+    Type: String
+    MinLength: '1'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_-]*'
+    Description: The prefix of the S3 bucket containing the Lambda package and templates.
+    Default: ctnfw-public-resources
+  LambdaPrefix:
+    AllowedPattern: ^[0-9a-zA-Z-/]*$
+    Default: packages/
+    Type: String
+  SpokeVPCRouteTable:
+    Type: String
+    MinLength: '3'
+    Description: The id of route table for the Spoke VPCs
+  FirewallRouteTable:
+    Type: String
+    MinLength: '3'
+    Description: The id of route table for the Inspection VPC where AWS Network Firewall is created.
+  DomainListFileName:
+    Type: String
+    MinLength: '3'
+    Description: The file name of the file containing the domain names to be blocked.
+  DomainListBucket:
+    Type: String
+    MinLength: '3'
+    Description: The prefix and file name of the file containing the domain names to be blocked.
+  NtwkFirewallRuleGroupName:
+    Type: String
+    MinLength: '1'
+    MaxLength: '128'
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    Description: The name of the centralized AWS Network Firewall Rule Group
+Resources:
+  AttachLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref CTNFWAttachmentLambda
+      Principal: sns.amazonaws.com 
+  CTNFWAttachmentLambda:
+    DependsOn: CopyZips
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "NFW-ControlTower-Attachment-LifeCycle"
+      Description: Function to Update TGW Route tables with VPC Atachment
+      Handler: index.handler
+      Role: !GetAtt 
+        - CTNFWAttachmentLambdaRole
+        - Arn
+      Code:
+        S3Bucket: !Ref 'LambdaZipsBucket'
+        S3Key: !Sub '${LambdaPrefix}ctnfw_attachment_integration_1.0.0.zip'
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 300
+      Environment:
+        Variables:
+          TGW_FIREWALL_RTBL_ID: !Ref FirewallRouteTable
+          TGW_SPOKE_RTBL_ID: !Ref SpokeVPCRouteTable
+  CTNFWAttachmentLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: Role used by Lambda for VPC Attachment association and propagation
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: EC2Operatons
+                Effect: Allow
+                Action:
+                  - ec2:AssociateTransitGatewayRouteTable
+                  - ec2:EnableTransitGatewayRouteTablePropagation
+                Resource: '*'
+              - Sid: S3Operations
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: 
+                  - !Join ['',['arn:aws:s3:::', !Ref LambdaZipsBucket ,'*']]
+  R53RDomainList:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+        Name: User-Managed-Firewall-List
+  R53RFirewallRuleGroup:
+    Type: AWS::Route53Resolver::FirewallRuleGroup
+    Properties:
+        FirewallRules:
+            -
+                Action: BLOCK
+                BlockResponse: NODATA
+                FirewallDomainListId: !GetAtt 'R53RDomainList.Id'
+                Priority: 1
+        Name: 'Initial-Rule-Group-CFN'
+  CTFirewallManagerPolicy:
+    Type: AWS::FMS::Policy
+    Properties:
+      ExcludeResourceTags: false
+      PolicyName: DnsFirewallPolicy
+      RemediationEnabled: true
+      ResourceType: AWS::EC2::VPC
+      SecurityServicePolicyData:
+        Type: DNS_FIREWALL
+        ManagedServiceData: !Sub '{"type":"DNS_FIREWALL",
+                                  "preProcessRuleGroups":[{"ruleGroupId": "${R53RFirewallRuleGroup}", "priority": 11}]}' 
+  LambdaListSplitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: LambdaListSplitPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            Resource: !Join ['',['arn:aws:s3:::', !Ref DomainListBucket ,'*']]
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: 'arn:aws:logs:*:*:*'
+          - Effect: Allow
+            Action:
+              - 'route53resolver:GetFirewallDomainList'
+              - 'route53resolver:ListFirewallDomainLists'
+              - 'route53resolver:ImportFirewallDomains'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'network-firewall:DescribeRuleGroup'
+              - 'network-firewall:UpdateRuleGroup'
+            Resource: 'arn:aws:network-firewall:*:*:*'                        
+  LambdaListSplitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Takes a domain list as input from S3, formats it for use with AWS Network Firewall and Route53 Resolver Firewall.
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt 'LambdaListSplitRole.Arn'
+      Timeout: 240
+      Environment:
+        Variables:
+          domain_list_name: !Ref DomainListFileName
+          domain_list_location: !Ref DomainListBucket
+          NtwkFirewallRuleGroupArn: !Sub 'arn:${AWS::Partition}:network-firewall:${AWS::Region}:${AWS::AccountId}:stateful-rulegroup/${NtwkFirewallRuleGroupName}'
+      Code:
+        ZipFile: |
+            from __future__ import print_function
+            import boto3
+            import json
+            import sys
+            import logging
+            import botocore.exceptions
+            import itertools
+            import os
+                        
+            domain_list_name = os.environ.get('domain_list_name')
+            domain_list_location = os.environ.get('domain_list_location')
+            NtwkFirewallRuleGroupArn = os.environ.get('NtwkFirewallRuleGroupArn')
+            def handler(event, context): 
+                s3 = boto3.client('s3')
+                r53rclient = boto3.client('route53resolver')
+                nfwclient = boto3.client('network-firewall')
+
+                bucketname = domain_list_location
+                objectname = domain_list_name
+                localfilename = '/tmp/' + domain_list_name.split('/')[1]
+                print(f"local file name : {localfilename}")
+                s3.download_file(bucketname, objectname, localfilename)
+
+                with open(localfilename, 'r') as f:
+                    data = f.read()
+                    f.close()
+                    
+                strdata = data.splitlines()
+
+                def appenddomains():
+                    dot_list = []
+                    astr_list = []
+                    for str in strdata:
+                        dotstr = '.' + str
+                        dot_list.append(dotstr)
+                        astrstr = '*' + dotstr
+                        astr_list.append(astrstr)
+                        astr_list.append(str)
+                    return dot_list, astr_list
+                    
+                appenddomainlist = appenddomains()
+                dotlist = appenddomainlist[0]
+                astrlist = appenddomainlist[1]
+
+                # save R53R (asterisk) file locally
+                with open ('/tmp/astrlist.txt', 'w') as filehandle:
+                    for listitem in astrlist:
+                        filehandle.write('%s\n' % listitem)
+                    filehandle.close()
+
+                # save R53R file to s3 for bulk upload
+                def upload_file(file_name, bucket, object_name=None):
+                    if object_name is None:
+                        object_name = file_name
+                    # Upload the file
+                    try:
+                        response = s3.upload_file('/tmp/' + file_name, bucket, object_name)
+                    except botocore.exceptions.ClientError as e:
+                        logging.error(e)
+                        return False
+                    return True 
+
+                astrlistpath = 's3://' + bucketname + '/astrlist.txt'
+                upload_file("astrlist.txt", bucketname)
+
+                r53rlistdomainlistsresponse = r53rclient.list_firewall_domain_lists()
+                print(f"R53 Domain List Response: {r53rlistdomainlistsresponse}")
+                r53rdomainlistid = [x['Id'] for x in r53rlistdomainlistsresponse['FirewallDomainLists'] if x['Name'] == 'User-Managed-Firewall-List']
+                print(f"R53 Domain List Id: {r53rdomainlistid}")
+                # R53R
+                importfwdomainresponse = r53rclient.import_firewall_domains(
+                    FirewallDomainListId=r53rdomainlistid[0],
+                    Operation='REPLACE',
+                    DomainFileUrl=astrlistpath
+                )
+
+                getfwdomainlistresponse = r53rclient.get_firewall_domain_list(
+                    FirewallDomainListId=r53rdomainlistid[0]
+                )
+
+                if importfwdomainresponse['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    print(f"Rule group update successful: {getfwdomainlistresponse}")
+                else:
+                    print(f"Rule group update failed: {getfwdomainlistresponse}")
+
+                ######## NFW below
+
+                # NFW
+                NtwkFirewallRuleGroupArnDict = {}
+                NtwkFirewallRuleGroupArnDict['ResourceArn'] = NtwkFirewallRuleGroupArn
+
+                nfwdescriberuleresponse = nfwclient.describe_rule_group(
+                    RuleGroupArn=NtwkFirewallRuleGroupArn
+                )
+                print(f"Current Rule Groups is : {nfwdescriberuleresponse}")
+                nfwblockeddomains = nfwdescriberuleresponse['RuleGroup']['RulesSource']['RulesSourceList']['Targets']
+                print(f"Domains currently blocked: {nfwblockeddomains}")
+                    
+                if 'Description' in nfwdescriberuleresponse['RuleGroupResponse']:
+                    print(f"NFW rule group description exists")
+                else:
+                    nfwdescriberuleresponse['RuleGroupResponse']['Description'] = "Domain list modified by Lambda"
+
+                def domainlistmerge():
+                # Assume dotlist will have more current domain entries, since an administrator updated it.
+                    deltalistadd = list(itertools.filterfalse(lambda x: x in nfwblockeddomains, dotlist))
+                    print(f"Adding domains: {deltalistadd}")
+                    # Existing domain list may have stale entries that were removed by an administrator
+                    deltalistremove = list(itertools.filterfalse(lambda x: x in dotlist, nfwblockeddomains))
+                    print(f"Removing domains: {deltalistremove}")
+                    
+                    nfwblockeddomainsremoved = [domain for domain in nfwblockeddomains if domain not in deltalistremove]
+                    mergedlist = [*nfwblockeddomainsremoved, *deltalistadd]
+                    nfwdescriberuleresponse['RuleGroup']['RulesSource']['RulesSourceList']['Targets'] = mergedlist
+                    print(f"Domains to be blocked: {mergedlist}")
+
+                domainlistmerge()
+
+                nfwupdaterulegroupresponse = nfwclient.update_rule_group(
+                    UpdateToken=nfwdescriberuleresponse["UpdateToken"],
+                    RuleGroupArn=NtwkFirewallRuleGroupArn,
+                    RuleGroup={
+                        'RulesSource': {
+                            'RulesSourceList': nfwdescriberuleresponse['RuleGroup']['RulesSource']['RulesSourceList']
+                        }
+                    },
+                    Description=nfwdescriberuleresponse['RuleGroupResponse']['Description']
+                )
+
+                if nfwupdaterulegroupresponse['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    print(f"Rule group update successful: {nfwupdaterulegroupresponse}")
+                else:
+                    print(f"Rule group update failed: {nfwupdaterulegroupresponse}")
+                return()
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LambdaListSplitFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${DomainListBucket}'
+
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${DomainListBucket}'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            s3 = boto3.resource('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData)
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:Put'
+                          ],
+                          'Filter': {
+                            'Key': {
+                                'FilterRules': [
+                                    {
+                                        'Name': 'prefix',
+                                        'Value': 'original/'
+                                    },
+                                    {
+                                        'Name': 'suffix',
+                                        'Value': '.txt'
+                                    },
+                                ]
+                            }
+                          }
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      Runtime: python3.8
+      Timeout: 50
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt LambdaListSplitFunction.Arn
+      Bucket: !Ref DomainListBucket
+  LambdaZipsBucket:
+    Type: AWS::S3::Bucket
+  CopyZips:
+    Type: Custom::CopyZips
+    Properties:
+      ServiceToken: !GetAtt 'CopyZipsFunction.Arn'
+      DestBucket: !Ref 'LambdaZipsBucket'
+      SourceBucket: !Ref 'LambdaBucket'
+      Prefix: !Ref 'LambdaPrefix'
+      Objects:
+        - ctnfw_attachment_integration_1.0.0.zip
+  CopyZipsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: lambda-copier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${LambdaBucket}/${LambdaPrefix}*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${LambdaZipsBucket}/${LambdaPrefix}*'
+  CopyZipsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Copies objects from a source S3 bucket to a destination
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt 'CopyZipsRole.Arn'
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import boto3
+          import cfnresponse
+          def copy_objects(source_bucket, dest_bucket, prefix, objects):
+              s3 = boto3.client('s3')
+              for o in objects:
+                  key = prefix + o
+                  copy_source = {
+                      'Bucket': source_bucket,
+                      'Key': key
+                  }
+                  print('copy_source: %s' % copy_source)
+                  print('dest_bucket = %s'%dest_bucket)
+                  print('key = %s' %key)
+                  s3.copy_object(CopySource=copy_source, Bucket=dest_bucket,
+                        Key=key)
+          def delete_objects(bucket, prefix, objects):
+              s3 = boto3.client('s3')
+              objects = {'Objects': [{'Key': prefix + o} for o in objects]}
+              s3.delete_objects(Bucket=bucket, Delete=objects)
+          def timeout(event, context):
+              logging.error('Execution is about to time out, sending failure response to CloudFormation')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+          def handler(event, context):
+              # make sure we send a failure to CloudFormation if the function
+              # is going to timeout
+              timer = threading.Timer((context.get_remaining_time_in_millis()
+                        / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              print('Received event: %s' % json.dumps(event))
+              status = cfnresponse.SUCCESS
+              try:
+                  source_bucket = event['ResourceProperties']['SourceBucket']
+                  dest_bucket = event['ResourceProperties']['DestBucket']
+                  prefix = event['ResourceProperties']['Prefix']
+                  objects = event['ResourceProperties']['Objects']
+                  if event['RequestType'] == 'Delete':
+                      delete_objects(dest_bucket, prefix, objects)
+                  else:
+                      copy_objects(source_bucket, dest_bucket, prefix, objects)
+              except Exception as e:
+                  logging.error('Exception: %s' % e, exc_info=True)
+                  status = cfnresponse.FAILED
+              finally:
+                  timer.cancel()
+                  cfnresponse.send(event, context, status, {}, None)

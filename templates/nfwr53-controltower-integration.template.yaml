@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Network Firewall, Route 53 Resolver & ControlTower Integration.
+Parameters:
+  NetworkAccountId:
+    Type: String
+    MinLength: '1'
+    Description: Account Id for the Networking account.
+  TGWId:
+    Type: String
+    MinLength: '3'
+    Description: The id of existing central Transit Gateway used within your multi-account environment.
+  SpokeVPCRouteTable:
+    Type: String
+    MinLength: '3'
+    Description: The id of route table for the Spoke VPCs
+  FirewallRouteTable:
+    Type: String
+    MinLength: '3'
+    Description: The id of route table for the Inspection VPC where AWS Network Firewall is created.
+  LaunchRoleName:
+      Type: String
+      Description: Name of the launch constraint role for VPC products. leave this blank to create the role.
+  LinkedRole1:
+      Type: String
+      Description: (Optional) The name of a role which can execute products in this portfolio.
+  LinkedRole2:
+      Type: String
+      Description: (Optional) The name of a second role which can execute products in this portfolio.
+  CreateEndUsers:
+      Type: String
+      Description: Select Yes to Create the ServiceCatalogEndusers IAM group. Select 'No' if you have already created the group.
+      AllowedValues:
+          - 'Yes'
+          - 'No'
+      Default: 'Yes'
+  RepoRootURL:
+    Type: String
+    Description: The full path to the S3 bucket containing the YAML resources.
+    Default: https://ctnfw-public-resources.s3.amazonaws.com/templates
+  DomainListFileName:
+    Type: String
+    MinLength: '3'
+    Description: The prefix and file name of the file containing the domain names to be blocked.
+    Default: original/blockeddomains.txt
+  DomainListBucket:
+    Type: String
+    MinLength: '1'
+    Description: The location of the S3 bucket where the blocked domain list is stored.
+  NtwkFirewallRuleGroupName:
+    Type: String
+    MinLength: '1'
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    Description: The name of the centralized AWS Network Firewall Rule Group where you want the blocked domains to be populated.
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Centralized Networking Resources
+        Parameters:
+          - NetworkAccountId
+          - TGWId
+          - SpokeVPCRouteTable
+          - FirewallRouteTable
+      - Label:
+          default: Service Catalog IAM Settings
+        Parameters:
+            - LaunchRoleName
+            - LinkedRole1
+            - LinkedRole2
+            - CreateEndUsers        
+      - Label:
+          default: Parameters for DNS security configuration
+        Parameters:
+            - DomainListFileName
+            - DomainListBucket
+            - NtwkFirewallRuleGroupName                    
+Conditions:
+  CreateLaunchConstraint:
+    'Fn::Equals':
+        - Ref: LaunchRoleName
+        - ''
+  CondCreateEndUsers:
+    'Fn::Equals':
+        - Ref: CreateEndUsers
+        - 'Yes'
+  CondLinkRole1:
+    'Fn::Not':
+        - 'Fn::Equals':
+              - Ref: LinkedRole1
+              - ''
+  CondLinkRole2:
+    'Fn::Not':
+        - 'Fn::Equals':
+              - Ref: LinkedRole2
+              - ''
+Resources:
+  CreateAccountLifeCycleRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Life Cycle for CreateManagedAccount
+      EventPattern:
+        source:
+          - aws.controltower
+        detail-type:
+          - AWS Service Event via CloudTrail
+        detail:
+          eventSource:
+            - controltower.amazonaws.com
+          eventName:
+            - CreateManagedAccount
+          userAgent:
+            - AWS Internal
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 
+            - CTNFWLifeCycleLambda
+            - Arn
+          Id: CreateAccountLifeCycle
+  CreateAccountLifeCycleRulePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref CTNFWLifeCycleLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 
+        - CreateAccountLifeCycleRule
+        - Arn
+  CTNFWLifeCycleLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: "NFW-ControlTower-Integration-LifeCycle"
+      Description: Function to handle Control Tower LifeCycle
+      Handler: index.handler
+      Role: !GetAtt 
+        - CTNFWLifeCycleLambdaRole
+        - Arn
+      Code:
+        S3Bucket: !Ref 'LambdaZipsBucket'
+        S3Key: 'packages/ctnfw_ct_integration_1.0.0.zip'
+      Runtime: nodejs12.x
+      MemorySize: 128
+      Timeout: 300
+      Environment:
+        Variables:
+          STACKSET_NAME: 'NFW-ControlTower-SCLaunchRoleStackSet'
+          STACKSET_URL: !Sub '${RepoRootURL}/sc-ec2vpc-launchrole.yml'
+          MASTER_ACCOUNT: !Ref 'AWS::AccountId'
+          TGW_ARN: !Join ['',['arn:aws:ec2:', !Ref 'AWS::Region', ':', !Ref NetworkAccountId, ':transit-gateway/', !Ref TGWId]]
+          EXECUTION_ROLE_ARN: !Join ['',['arn:aws:iam::',  !Ref NetworkAccountId, ':role/AWSControlTowerExecution']]
+    DependsOn:
+      - CopyZips
+  CTNFWLifeCycleLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: Role used by Lambda for life cycle / new account creation
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: STSAssumeRole
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 
+                  - 'arn:aws:iam::*:role/AWSControlTowerExecution'
+              - Sid: RAMOperations
+                Effect: Allow
+                Action:
+                  - ram:CreateResourceShare
+                Resource: '*'
+              - Sid: IAMOperations
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole'
+              - Sid: S3Operations
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: 
+                  - !Join ['',['arn:aws:s3:::', !Ref LambdaZipsBucket ,'*']]
+              - Sid: CloudFormationOperations
+                Effect: Allow
+                Action:
+                  - 'cloudformation:CreateStackInstances'
+                  - 'cloudformation:DescribeStackInstance'
+                  - 'cloudformation:DescribeStackSetOperation'
+                  - 'cloudformation:CreateStackSet'
+                  - 'cloudformation:DescribeStackSet'
+                Resource:
+                  - !Join ['',['arn:aws:cloudformation:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':stackset/NFW-ControlTower-SCLaunchRoleStackSet', ':*']]
+  SCLaunchRoleStackSet:
+      Type: AWS::CloudFormation::StackSet
+      Properties:
+        StackSetName: 'NFW-ControlTower-SCLaunchRoleStackSet'
+        AdministrationRoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole'
+        ExecutionRoleName: AWSControlTowerExecution
+        PermissionModel: SELF_MANAGED
+        Capabilities:
+          - CAPABILITY_NAMED_IAM
+        TemplateURL: !Sub '${RepoRootURL}/sc-ec2vpc-launchrole.yml'
+  CreateAttachmentStackSet:
+      Type: AWS::CloudFormation::StackSet
+      Properties:
+        StackSetName: 'CreateAttachmentStackSet'
+        AdministrationRoleARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole'
+        ExecutionRoleName: AWSControlTowerExecution
+        PermissionModel: SELF_MANAGED
+        Parameters: 
+          - ParameterKey: 'CreateAttachmentLambdaArn' 
+            ParameterValue: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${NetworkAccountId}:function:NFW-ControlTower-Attachment-LifeCycle' 
+        StackInstancesGroup:
+          - Regions:
+              - us-west-2
+            DeploymentTargets:
+              Accounts:
+                - !Ref NetworkAccountId      
+        Capabilities:
+          - CAPABILITY_NAMED_IAM
+        TemplateURL: !Sub '${RepoRootURL}/attachVpc.yaml'
+      DependsOn:
+        - NetworkingStackSet 
+  NetworkingStackSet:
+      Type: AWS::CloudFormation::StackSet
+      DeletionPolicy: Retain
+      Properties:
+        StackSetName: 'CTNetworkingStackSet'
+        AdministrationRoleARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole'
+        ExecutionRoleName: AWSControlTowerExecution
+        PermissionModel: SELF_MANAGED
+        Parameters: 
+          - ParameterKey: 'SpokeVPCRouteTable' 
+            ParameterValue: !Ref SpokeVPCRouteTable 
+          - ParameterKey: 'FirewallRouteTable' 
+            ParameterValue: !Ref FirewallRouteTable
+          - ParameterKey: 'DomainListFileName' 
+            ParameterValue: !Ref DomainListFileName                      
+          - ParameterKey: 'DomainListBucket' 
+            ParameterValue: !Ref DomainListBucket
+          - ParameterKey: 'NtwkFirewallRuleGroupName' 
+            ParameterValue: !Ref NtwkFirewallRuleGroupName
+        StackInstancesGroup:
+          - Regions:
+              - !Ref 'AWS::Region'
+            DeploymentTargets:
+              Accounts:
+                - !Ref NetworkAccountId      
+        Capabilities:
+          - CAPABILITY_NAMED_IAM
+        TemplateURL: !Sub '${RepoRootURL}/networkingStack.yaml'
+  SCVPCportfolio:
+      Type: 'AWS::ServiceCatalog::Portfolio'
+      Properties:
+        ProviderName: 'IT Services'
+        Description: 'Service Catalog Portfolio that contains reference architecture products for Amazon Virtual Private Cloud.'
+        DisplayName: 'Service Catalog VPC Reference Architecture'
+  addrole1:
+      Type: 'AWS::ServiceCatalog::PortfolioPrincipalAssociation'
+      Condition: CondLinkRole1
+      Properties:
+        PrincipalARN:
+            'Fn::Sub': 'arn:aws:iam::${AWS::AccountId}:role/${LinkedRole1}'
+        PortfolioId:
+            Ref: SCVPCportfolio
+        PrincipalType: IAM
+  addrole2:
+      Type: 'AWS::ServiceCatalog::PortfolioPrincipalAssociation'
+      Condition: CondLinkRole2
+      Properties:
+        PrincipalARN:
+            'Fn::Sub': 'arn:aws:iam::${AWS::AccountId}:role/${LinkedRole2}'
+        PortfolioId:
+            Ref: SCVPCportfolio
+        PrincipalType: IAM
+  stackServiceCatalogEndusers:
+      Type: 'AWS::CloudFormation::Stack'
+      Condition: CondCreateEndUsers
+      Properties:
+          TemplateURL: !Sub '${RepoRootURL}/sc-enduser-iam.yml'
+          TimeoutInMinutes: 5
+  LinkEndusersRole:
+      Type: 'AWS::ServiceCatalog::PortfolioPrincipalAssociation'
+      Properties:
+          PrincipalARN:
+            'Fn::If':
+                - CondCreateEndUsers
+                - 'Fn::GetAtt':
+                        - stackServiceCatalogEndusers
+                        - Outputs.EndUserRoleArn
+                - 'Fn::Sub': 'arn:aws:iam::${AWS::AccountId}:role/ServiceCatalogEndusers'
+          PortfolioId:
+              Ref: SCVPCportfolio
+          PrincipalType: IAM
+  LinkEndusersGroup:
+      Type: 'AWS::ServiceCatalog::PortfolioPrincipalAssociation'
+      Properties:
+          PrincipalARN:
+            'Fn::If':
+                - CondCreateEndUsers
+                - 'Fn::GetAtt':
+                    - stackServiceCatalogEndusers
+                    - Outputs.EndUserGroupArn
+                - 'Fn::Sub': 'arn:aws:iam::${AWS::AccountId}:group/ServiceCatalogEndusers'
+          PortfolioId:
+              Ref: SCVPCportfolio
+          PrincipalType: IAM
+  LaunchConstraintRole:
+      Type: 'AWS::CloudFormation::Stack'
+      Condition: CreateLaunchConstraint
+      Properties:
+          TemplateURL: !Sub '${RepoRootURL}/sc-ec2vpc-launchrole.yml'
+          TimeoutInMinutes: 5
+  vpcproduct:
+      Type: 'AWS::CloudFormation::Stack'
+      Properties:
+          Parameters:
+              PortfolioProvider: 'IT Services'
+              LaunchConstraintRole:
+                  'Fn::If':
+                      - CreateLaunchConstraint
+                      - 'Fn::GetAtt':
+                          - LaunchConstraintRole
+                          - Outputs.LaunchRoleName
+                      - Ref: LaunchRoleName
+              PortfolioId:
+                  Ref: SCVPCportfolio
+              RepoRootURL: !Ref RepoRootURL
+          TemplateURL: !Sub '${RepoRootURL}/sc-product-vpc.yaml'
+          TimeoutInMinutes: 5
+  LambdaZipsBucket:
+    Type: AWS::S3::Bucket
+  CopyZips:
+    Type: Custom::CopyZips
+    Properties:
+      ServiceToken: !GetAtt 'CopyZipsFunction.Arn'
+      DestBucket: !Ref 'LambdaZipsBucket'
+      SourceBucket: 'ctnfw-public-resources'
+      Prefix: 'packages/'
+      Objects:
+        - ctnfw_ct_integration_1.0.0.zip
+  CopyZipsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: lambda-copier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - 'arn:aws:s3:::ctnfw-public-resources/packages/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${LambdaZipsBucket}/packages/*'
+  CopyZipsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Copies objects from a source S3 bucket to a destination
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt 'CopyZipsRole.Arn'
+      Timeout: 240
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import boto3
+          import cfnresponse
+          def copy_objects(source_bucket, dest_bucket, prefix, objects):
+              s3 = boto3.client('s3')
+              for o in objects:
+                  key = prefix + o
+                  copy_source = {
+                      'Bucket': source_bucket,
+                      'Key': key
+                  }
+                  print('copy_source: %s' % copy_source)
+                  print('dest_bucket = %s'%dest_bucket)
+                  print('key = %s' %key)
+                  s3.copy_object(CopySource=copy_source, Bucket=dest_bucket,
+                        Key=key)
+          def delete_objects(bucket, prefix, objects):
+              s3 = boto3.client('s3')
+              objects = {'Objects': [{'Key': prefix + o} for o in objects]}
+              s3.delete_objects(Bucket=bucket, Delete=objects)
+          def timeout(event, context):
+              logging.error('Execution is about to time out, sending failure response to CloudFormation')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+          def handler(event, context):
+              # make sure we send a failure to CloudFormation if the function
+              # is going to timeout
+              timer = threading.Timer((context.get_remaining_time_in_millis()
+                        / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              print('Received event: %s' % json.dumps(event))
+              status = cfnresponse.SUCCESS
+              try:
+                  source_bucket = event['ResourceProperties']['SourceBucket']
+                  dest_bucket = event['ResourceProperties']['DestBucket']
+                  prefix = event['ResourceProperties']['Prefix']
+                  objects = event['ResourceProperties']['Objects']
+                  if event['RequestType'] == 'Delete':
+                      delete_objects(dest_bucket, prefix, objects)
+                  else:
+                      copy_objects(source_bucket, dest_bucket, prefix, objects)
+              except Exception as e:
+                  logging.error('Exception: %s' % e, exc_info=True)
+                  status = cfnresponse.FAILED
+              finally:
+                  timer.cancel()
+                  cfnresponse.send(event, context, status, {}, None)

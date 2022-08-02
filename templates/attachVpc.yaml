@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Network Firewall & ControlTower Integration - This deploys resources in us-west-2 to receive Network Manager events from transit gateway and send it to lambda.
+
+Parameters:
+  CreateAttachmentLambdaArn:
+    Type: String
+    MinLength: '1'
+    Description: The prefix of the S3 bucket containing the Lambda package and templates.
+  AttachmentSnsTopicName:
+    Type: String
+    MinLength: '3'
+    Description: SNS Topic to which the Lambda will push notifications in case of failure or important notifications.
+    Default: NFW-Control-Tower-Attachment-Topic
+Resources:
+  AttachmentSnsTopic:
+    Type : AWS::SNS::Topic
+    Properties:
+        TopicName: !Ref AttachmentSnsTopicName
+        DisplayName: !Ref AttachmentSnsTopicName
+        Subscription:
+          - Endpoint:  !Ref CreateAttachmentLambdaArn
+            Protocol: "lambda"
+  AttachmentTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      Topics:
+        - !Ref AttachmentSnsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'sns:Publish'
+            Resource: !Ref AttachmentSnsTopic
+            Principal:
+              Service: 'events.amazonaws.com' 
+  CreateAttachmentRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: CW Rule for Create Attachment Event
+      EventPattern:
+        source:
+          - aws.networkmanager
+        detail-type:
+          - Network Manager Topology Change
+        detail:
+          changeType:
+            - VPC-ATTACHMENT-CREATED
+      State: ENABLED
+      Targets:
+        - Arn: !Ref AttachmentSnsTopic 
+          Id: CreateAttachmentTGW
+Outputs:
+  AttachmentTopicName: 
+      Value: !Ref AttachmentSnsTopic

@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: VPC ServiceCatalog product.
+Parameters:
+    PortfolioProvider:
+        Type: String
+        Description: Owner and Distributor Name
+    LaunchConstraintRole:
+        Type: String
+        Description: ARN of the launch constraint role for VPC products.
+    PortfolioId:
+        Type: String
+        Description: The ServiceCatalog portfolio this product will be attached to.
+    RepoRootURL:
+        Type: String
+        Description: The full path to the S3 bucket containing the YAML resources.
+        Default: https://ctnfw-public-resources.s3.amazonaws.com/templates/
+Resources:
+    scvpcproduct:
+        Type: 'AWS::ServiceCatalog::CloudFormationProduct'
+        Properties:
+            Name: Amazon Virtual Private Cloud (VPC)
+            Description: This product builds a multi-availability zone Amazon AWS Virtual Private Cloud (VPC) with an option to include a single instance Amazon Linux bastion instance.
+            Owner:
+                Ref: PortfolioProvider
+            Distributor:
+                Ref: PortfolioProvider
+            SupportDescription: Operations Team
+            SupportEmail: support@yourcompany.com
+            AcceptLanguage: en
+            SupportUrl: 'http://helpdesk.yourcompany.com'
+            ProvisioningArtifactParameters:
+                - 
+                    Description: baseline version
+                    Info:
+                        LoadTemplateFromURL: !Sub '${RepoRootURL}/codebuild-vpc-cfn.yaml'
+                    Name: v1.0
+    Associatevpc:
+        Type: 'AWS::ServiceCatalog::PortfolioProductAssociation'
+        Properties:
+            PortfolioId:
+                Ref: PortfolioId
+            ProductId:
+                Ref: scvpcproduct
+    constraintec2linux:
+        Type: 'AWS::ServiceCatalog::LaunchRoleConstraint'
+        DependsOn: Associatevpc
+        Properties:
+            PortfolioId:
+                Ref: PortfolioId
+            ProductId:
+                Ref: scvpcproduct
+            LocalRoleName:
+                Ref: LaunchConstraintRole
+            Description:
+                Ref: LaunchConstraintRole
+Outputs:
+    ProductId:
+        Value:
+            Ref: scvpcproduct
